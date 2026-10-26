@@ -1,0 +1,249 @@
+package bb;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
+/**
+ * Small HTTP helper for the BlockBuddy API tests.
+ *
+ * Settings come from environment variables:
+ *   BB_BASE_URL               the app under test, e.g. http://localhost:3000
+ *   SUPABASE_URL              the TEST Supabase project URL (never the live one)
+ *   SUPABASE_ANON_KEY         that project's anon key
+ *   SUPABASE_SERVICE_ROLE_KEY that project's service role key (creates/deletes test users)
+ *
+ * How sign-in works: the app reads the Supabase session from a cookie called
+ * sb-[project-ref]-auth-token (value "base64-" + base64url(session JSON), split into
+ * .0, .1, ... parts when longer than 3180 chars). It does NOT read an Authorization header.
+ * So we sign in with email + password against Supabase Auth and build that cookie.
+ */
+public final class Api {
+
+    /** The live project. Tests refuse to run against it. */
+    private static final String LIVE_PROJECT_REF = "bbcycaysbhxgnoffyfyp";
+    private static final int MAX_CHUNK = 3180;
+    public static final String PASSWORD = "Test-Only-Pass-2026!";
+
+    public static final ObjectMapper JSON = new ObjectMapper();
+    private static final HttpClient HTTP = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(15)).build();
+
+    public static final String BASE_URL = env("BB_BASE_URL", "http://localhost:3000");
+    public static final String SUPABASE_URL = env("SUPABASE_URL", null);
+    private static final String ANON_KEY = env("SUPABASE_ANON_KEY", null);
+    private static final String SERVICE_KEY = env("SUPABASE_SERVICE_ROLE_KEY", null);
+
+    static {
+        if (SUPABASE_URL.contains(LIVE_PROJECT_REF) || BASE_URL.contains("blockbuddy-app.vercel.app")) {
+            throw new IllegalStateException(
+                    "Refusing to run: these tests create and delete users. Point them at a TEST project.");
+        }
+    }
+
+    private Api() {}
+
+    private static String env(String name, String fallback) {
+        String v = System.getenv(name);
+        if (v == null || v.isBlank()) {
+            if (fallback == null) throw new IllegalStateException("Missing environment variable " + name);
+            return fallback;
+        }
+        return v.endsWith("/") ? v.substring(0, v.length() - 1) : v;
+    }
+
+    // ---------- response ----------
+
+    public record Res(int status, String body) {
+        public JsonNode json() {
+            try {
+                return body == null || body.isBlank() ? JSON.nullNode() : JSON.readTree(body);
+            } catch (Exception e) {
+                throw new AssertionError("Not JSON (HTTP " + status + "): " + body, e);
+            }
+        }
+
+        /** The "error" field of a failed call, e.g. "handle_taken". */
+        public String error() {
+            JsonNode e = json().get("error");
+            return e == null ? null : e.asText();
+        }
+
+        @Override
+        public String toString() {
+            return "HTTP " + status + " " + body;
+        }
+    }
+
+    // ---------- test user ----------
+
+    /** A signed-in test account. userId is the app's users.id, filled after claim-handle. */
+    public static final class TestUser {
+        public final String email;
+        public final String authId;
+        public final String cookie;
+        public String userId;
+        public String handle;
+
+        TestUser(String email, String authId, String cookie) {
+            this.email = email;
+            this.authId = authId;
+            this.cookie = cookie;
+        }
+    }
+
+    /** Short random lowercase text, safe inside a handle. */
+    public static String rand(int n) {
+        return UUID.randomUUID().toString().replace("-", "").substring(0, n);
+    }
+
+    /** A handle that is valid and almost surely unused: "jt" + 10 hex chars = 12 chars. */
+    public static String newHandle() {
+        return "jt" + rand(10);
+    }
+
+    /** Creates a confirmed auth user in the TEST project and signs it in. No email is sent. */
+    public static TestUser createUser(String email) throws Exception {
+        String body = JSON.writeValueAsString(Map.of(
+                "email", email, "password", PASSWORD, "email_confirm", true));
+        HttpResponse<String> created = HTTP.send(HttpRequest.newBuilder(URI.create(SUPABASE_URL + "/auth/v1/admin/users"))
+                        .header("apikey", SERVICE_KEY)
+                        .header("Authorization", "Bearer " + SERVICE_KEY)
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString(body)).build(),
+                HttpResponse.BodyHandlers.ofString());
+        if (created.statusCode() >= 300) {
+            throw new IllegalStateException("Could not create test user: " + created.statusCode() + " " + created.body());
+        }
+        String authId = JSON.readTree(created.body()).get("id").asText();
+
+        String login = JSON.writeValueAsString(Map.of("email", email, "password", PASSWORD));
+        HttpResponse<String> session = HTTP.send(HttpRequest.newBuilder(
+                                URI.create(SUPABASE_URL + "/auth/v1/token?grant_type=password"))
+                        .header("apikey", ANON_KEY)
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString(login)).build(),
+                HttpResponse.BodyHandlers.ofString());
+        if (session.statusCode() != 200) {
+            throw new IllegalStateException("Sign-in failed (is Email + password turned on in the test project?): "
+                    + session.statusCode() + " " + session.body());
+        }
+        return new TestUser(email, authId, sessionCookie(session.body()));
+    }
+
+    /** Creates a user and claims a handle for it, so it can use every API. */
+    public static TestUser createReadyUser(String emailDomain) throws Exception {
+        TestUser u = createUser("bbtest." + rand(8) + "@" + emailDomain);
+        String handle = newHandle();
+        Res r = claimHandle(u, handle, "JUnit " + handle);
+        if (r.status() != 200) throw new IllegalStateException("claim-handle failed: " + r);
+        u.userId = r.json().get("user").get("id").asText();
+        u.handle = handle;
+        return u;
+    }
+
+    /** Builds the exact cookie header @supabase/ssr 0.12 reads (base64url, chunked). */
+    static String sessionCookie(String sessionJson) {
+        String ref = URI.create(SUPABASE_URL).getHost().split("\\.")[0];
+        String name = "sb-" + ref + "-auth-token";
+        String value = "base64-" + Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(sessionJson.getBytes(StandardCharsets.UTF_8));
+        if (value.length() <= MAX_CHUNK) return name + "=" + value;
+        List<String> parts = new ArrayList<>();
+        for (int i = 0, n = 0; i < value.length(); i += MAX_CHUNK, n++) {
+            parts.add(name + "." + n + "=" + value.substring(i, Math.min(value.length(), i + MAX_CHUNK)));
+        }
+        return String.join("; ", parts);
+    }
+
+    /** Deletes everything the user made (the app's own account delete), then the auth user. */
+    public static void deleteUser(TestUser u) {
+        if (u == null) return;
+        try {
+            call("POST", "/api/profile/delete", null, u); // cascades requests, friendships, etc.
+        } catch (Exception ignored) {
+            // fall through to the admin delete
+        }
+        try {
+            HTTP.send(HttpRequest.newBuilder(URI.create(SUPABASE_URL + "/auth/v1/admin/users/" + u.authId))
+                            .header("apikey", SERVICE_KEY)
+                            .header("Authorization", "Bearer " + SERVICE_KEY)
+                            .DELETE().build(),
+                    HttpResponse.BodyHandlers.ofString());
+        } catch (Exception ignored) {
+            // already gone
+        }
+    }
+
+    // ---------- app API ----------
+
+    /** Any app API call. body may be null. user may be null (signed out). */
+    public static Res call(String method, String path, Object body, TestUser user) throws Exception {
+        HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(BASE_URL + path))
+                .timeout(Duration.ofSeconds(30))
+                .header("Content-Type", "application/json");
+        if (user != null) b.header("Cookie", user.cookie);
+        HttpRequest.BodyPublisher pub = body == null
+                ? HttpRequest.BodyPublishers.noBody()
+                : HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(body));
+        HttpResponse<String> r = HTTP.send(b.method(method, pub).build(), HttpResponse.BodyHandlers.ofString());
+        return new Res(r.statusCode(), r.body());
+    }
+
+    public static Res claimHandle(TestUser u, String handle, String name) throws Exception {
+        return call("POST", "/api/profile/claim-handle", Map.of("handle", handle, "name", name), u);
+    }
+
+    public static Res profile(TestUser u) throws Exception {
+        return call("GET", "/api/profile", null, u);
+    }
+
+    /** Makes a and b buddies (a sends, b accepts). Needed: only the audience can accept. */
+    public static void makeBuddies(TestUser a, TestUser b) throws Exception {
+        Res sent = call("POST", "/api/friends/request", Map.of("handle", b.handle), a);
+        if (sent.status() != 200) throw new IllegalStateException("friend request failed: " + sent);
+        Res ok = call("POST", "/api/friends/respond", Map.of("requesterId", a.userId, "accept", true), b);
+        if (ok.status() != 200) throw new IllegalStateException("friend accept failed: " + ok);
+    }
+
+    /** Posts an item request visible to the given buddies. Returns the request id. */
+    public static String postRequest(TestUser requester, List<String> audienceFriendIds) throws Exception {
+        Res r = call("POST", "/api/requests", Map.of(
+                "kind", "item",
+                "what", "JUnit test item " + rand(4),
+                "audienceGroupIds", List.of(),
+                "audienceFriendIds", audienceFriendIds,
+                "taggedFriendIds", List.of()), requester);
+        if (r.status() != 200) throw new IllegalStateException("post request failed: " + r);
+        return r.json().get("requestId").asText();
+    }
+
+    public static Res accept(TestUser u, String requestId) throws Exception {
+        return call("POST", "/api/requests/" + requestId + "/accept", null, u);
+    }
+
+    /** "Got it": only the REQUESTER can call this. Moves accepted to done and sends thanks. */
+    public static Res delivered(TestUser u, String requestId) throws Exception {
+        return call("POST", "/api/requests/" + requestId + "/delivered", Map.of("emoji", "🙏"), u);
+    }
+
+    /** "Handed over" ping: only the BUDDY who accepted can call this. Status stays accepted. */
+    public static Res handedOver(TestUser u, String requestId) throws Exception {
+        return call("POST", "/api/requests/" + requestId + "/handed-over", null, u);
+    }
+
+    public static Res detail(TestUser u, String requestId) throws Exception {
+        return call("GET", "/api/requests/" + requestId, null, u);
+    }
+}
