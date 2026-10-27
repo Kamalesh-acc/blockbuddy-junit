@@ -18,48 +18,40 @@ import java.util.UUID;
 /**
  * Small HTTP helper for the BlockBuddy API tests.
  *
- * Settings come from environment variables:
- *   BB_BASE_URL               the app under test, e.g. http://localhost:3000
- *   SUPABASE_URL              the TEST Supabase project URL (never the live one)
- *   SUPABASE_ANON_KEY         that project's anon key
- *   SUPABASE_SERVICE_ROLE_KEY that project's service role key (creates/deletes test users)
+ * Works with no setup: by default it talks to the TEST copy of the app,
+ * https://blockbuddy-test.vercel.app, which uses its own separate test database.
+ * (Optional: set BB_BASE_URL to point at another test copy.)
  *
  * How sign-in works: the app reads the Supabase session from a cookie called
  * sb-[project-ref]-auth-token (value "base64-" + base64url(session JSON), split into
  * .0, .1, ... parts when longer than 3180 chars). It does NOT read an Authorization header.
- * So we sign in with email + password against Supabase Auth and build that cookie.
+ * The test copy has a helper, /api/test-support/user, that creates a confirmed test
+ * account and returns its session. We turn that session into the cookie.
  */
 public final class Api {
 
-    /** The live project. Tests refuse to run against it. */
+    /** The live project and site. Tests refuse to run against them. */
     private static final String LIVE_PROJECT_REF = "bbcycaysbhxgnoffyfyp";
+    private static final String LIVE_SITE = "blockbuddy-app.vercel.app";
     private static final int MAX_CHUNK = 3180;
-    public static final String PASSWORD = "Test-Only-Pass-2026!";
 
     public static final ObjectMapper JSON = new ObjectMapper();
     private static final HttpClient HTTP = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(15)).build();
+            .connectTimeout(Duration.ofSeconds(20)).build();
 
-    public static final String BASE_URL = env("BB_BASE_URL", "http://localhost:3000");
-    public static final String SUPABASE_URL = env("SUPABASE_URL", null);
-    private static final String ANON_KEY = env("SUPABASE_ANON_KEY", null);
-    private static final String SERVICE_KEY = env("SUPABASE_SERVICE_ROLE_KEY", null);
+    public static final String BASE_URL = baseUrl();
 
     static {
-        if (SUPABASE_URL.contains(LIVE_PROJECT_REF) || BASE_URL.contains("blockbuddy-app.vercel.app")) {
-            throw new IllegalStateException(
-                    "Refusing to run: these tests create and delete users. Point them at a TEST project.");
+        if (BASE_URL.contains(LIVE_SITE)) {
+            throw new IllegalStateException("Refusing to run against the live app. Use the test copy.");
         }
     }
 
     private Api() {}
 
-    private static String env(String name, String fallback) {
-        String v = System.getenv(name);
-        if (v == null || v.isBlank()) {
-            if (fallback == null) throw new IllegalStateException("Missing environment variable " + name);
-            return fallback;
-        }
+    private static String baseUrl() {
+        String v = System.getenv("BB_BASE_URL");
+        if (v == null || v.isBlank()) v = "https://blockbuddy-test.vercel.app";
         return v.endsWith("/") ? v.substring(0, v.length() - 1) : v;
     }
 
@@ -91,14 +83,12 @@ public final class Api {
     /** A signed-in test account. userId is the app's users.id, filled after claim-handle. */
     public static final class TestUser {
         public final String email;
-        public final String authId;
         public final String cookie;
         public String userId;
         public String handle;
 
-        TestUser(String email, String authId, String cookie) {
+        TestUser(String email, String cookie) {
             this.email = email;
-            this.authId = authId;
             this.cookie = cookie;
         }
     }
@@ -113,38 +103,33 @@ public final class Api {
         return "jt" + rand(10);
     }
 
-    /** Creates a confirmed auth user in the TEST project and signs it in. No email is sent. */
-    public static TestUser createUser(String email) throws Exception {
-        String body = JSON.writeValueAsString(Map.of(
-                "email", email, "password", PASSWORD, "email_confirm", true));
-        HttpResponse<String> created = HTTP.send(HttpRequest.newBuilder(URI.create(SUPABASE_URL + "/auth/v1/admin/users"))
-                        .header("apikey", SERVICE_KEY)
-                        .header("Authorization", "Bearer " + SERVICE_KEY)
-                        .header("Content-Type", "application/json")
-                        .POST(HttpRequest.BodyPublishers.ofString(body)).build(),
-                HttpResponse.BodyHandlers.ofString());
-        if (created.statusCode() >= 300) {
-            throw new IllegalStateException("Could not create test user: " + created.statusCode() + " " + created.body());
-        }
-        String authId = JSON.readTree(created.body()).get("id").asText();
+    /** A test email. Must start with "bbtest." (the test helper only accepts these). */
+    public static String testEmail(String domain) {
+        return "bbtest." + rand(10) + "@" + domain;
+    }
 
-        String login = JSON.writeValueAsString(Map.of("email", email, "password", PASSWORD));
-        HttpResponse<String> session = HTTP.send(HttpRequest.newBuilder(
-                                URI.create(SUPABASE_URL + "/auth/v1/token?grant_type=password"))
-                        .header("apikey", ANON_KEY)
+    /** Creates a confirmed test account on the test copy and signs it in. No email is sent. */
+    public static TestUser createUser(String email) throws Exception {
+        HttpResponse<String> r = HTTP.send(HttpRequest.newBuilder(URI.create(BASE_URL + "/api/test-support/user"))
+                        .timeout(Duration.ofSeconds(60))
                         .header("Content-Type", "application/json")
-                        .POST(HttpRequest.BodyPublishers.ofString(login)).build(),
+                        .POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(Map.of("email", email))))
+                        .build(),
                 HttpResponse.BodyHandlers.ofString());
-        if (session.statusCode() != 200) {
-            throw new IllegalStateException("Sign-in failed (is Email + password turned on in the test project?): "
-                    + session.statusCode() + " " + session.body());
+        if (r.statusCode() != 200) {
+            throw new IllegalStateException("Could not create test user: " + r.statusCode() + " " + r.body());
         }
-        return new TestUser(email, authId, sessionCookie(session.body()));
+        JsonNode j = JSON.readTree(r.body());
+        String supabaseUrl = j.get("supabaseUrl").asText();
+        if (supabaseUrl.contains(LIVE_PROJECT_REF)) {
+            throw new IllegalStateException("Refusing to run: this server uses the live database.");
+        }
+        return new TestUser(email, sessionCookie(supabaseUrl, JSON.writeValueAsString(j.get("session"))));
     }
 
     /** Creates a user and claims a handle for it, so it can use every API. */
     public static TestUser createReadyUser(String emailDomain) throws Exception {
-        TestUser u = createUser("bbtest." + rand(8) + "@" + emailDomain);
+        TestUser u = createUser(testEmail(emailDomain));
         String handle = newHandle();
         Res r = claimHandle(u, handle, "JUnit " + handle);
         if (r.status() != 200) throw new IllegalStateException("claim-handle failed: " + r);
@@ -154,8 +139,8 @@ public final class Api {
     }
 
     /** Builds the exact cookie header @supabase/ssr 0.12 reads (base64url, chunked). */
-    static String sessionCookie(String sessionJson) {
-        String ref = URI.create(SUPABASE_URL).getHost().split("\\.")[0];
+    static String sessionCookie(String supabaseUrl, String sessionJson) {
+        String ref = URI.create(supabaseUrl).getHost().split("\\.")[0];
         String name = "sb-" + ref + "-auth-token";
         String value = "base64-" + Base64.getUrlEncoder().withoutPadding()
                 .encodeToString(sessionJson.getBytes(StandardCharsets.UTF_8));
@@ -167,20 +152,17 @@ public final class Api {
         return String.join("; ", parts);
     }
 
-    /** Deletes everything the user made (the app's own account delete), then the auth user. */
+    /** Deletes everything the user made (the app's own account delete), then the auth account. */
     public static void deleteUser(TestUser u) {
         if (u == null) return;
         try {
             call("POST", "/api/profile/delete", null, u); // cascades requests, friendships, etc.
         } catch (Exception ignored) {
-            // fall through to the admin delete
+            // fall through
         }
         try {
-            HTTP.send(HttpRequest.newBuilder(URI.create(SUPABASE_URL + "/auth/v1/admin/users/" + u.authId))
-                            .header("apikey", SERVICE_KEY)
-                            .header("Authorization", "Bearer " + SERVICE_KEY)
-                            .DELETE().build(),
-                    HttpResponse.BodyHandlers.ofString());
+            // Finishes the job when profile/delete fails or the account never claimed a handle.
+            call("DELETE", "/api/test-support/user", Map.of("email", u.email), null);
         } catch (Exception ignored) {
             // already gone
         }
@@ -191,7 +173,7 @@ public final class Api {
     /** Any app API call. body may be null. user may be null (signed out). */
     public static Res call(String method, String path, Object body, TestUser user) throws Exception {
         HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(BASE_URL + path))
-                .timeout(Duration.ofSeconds(30))
+                .timeout(Duration.ofSeconds(60))
                 .header("Content-Type", "application/json");
         if (user != null) b.header("Cookie", user.cookie);
         HttpRequest.BodyPublisher pub = body == null
