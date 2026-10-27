@@ -93,6 +93,7 @@ class M1HandleTest {
     }
 
     @ParameterizedTest(name = "J-06 invalid handle \"{0}\" is rejected")
+    @DisplayName("J-06 Handles with invalid characters are rejected")
     @ValueSource(strings = {
             "ab",                // too short (min 3)
             "abcdefghijklmnop",  // too long (16, max 15)
