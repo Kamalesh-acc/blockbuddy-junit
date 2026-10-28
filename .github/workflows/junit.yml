@@ -3,6 +3,8 @@ name: JUnit tests
 on:
   push:
   workflow_dispatch:
+  schedule:
+    - cron: "30 2 * * *"   # daily, keeps the free test database awake
 
 permissions:
   contents: read
