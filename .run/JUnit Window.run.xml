@@ -1,0 +1,10 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="JUnit Window" type="Application" factoryName="Application">
+    <option name="MAIN_CLASS_NAME" value="bb.JUnitWindow" />
+    <module name="blockbuddy-junit" />
+    <option name="PROGRAM_PARAMETERS" value="bb.M1HandleTest" />
+    <method v="2">
+      <option name="Make" enabled="true" />
+    </method>
+  </configuration>
+</component>
