@@ -50,6 +50,15 @@ public class JUnitWindow extends JFrame {
 
     private int total, done, nErrors, nFailures;
 
+    /** True once this window starts its own run, so JUnitWindowListener does not open a second window. */
+    static volatile boolean ownRun;
+    /** Opened by JUnitWindowListener inside IntelliJ / Maven: closing must not kill that JVM. */
+    boolean embedded;
+
+    void closeWindow() {
+        if (embedded) dispose(); else System.exit(0);
+    }
+
     public JUnitWindow(String initial) {
         super("JUnit");
         setDefaultCloseOperation(EXIT_ON_CLOSE);
@@ -57,7 +66,7 @@ public class JUnitWindow extends JFrame {
         JMenu menu = new JMenu("JUnit");
         menu.setMnemonic('J');
         JMenuItem exit = new JMenuItem("Exit");
-        exit.addActionListener(e -> System.exit(0));
+        exit.addActionListener(e -> closeWindow());
         menu.add(exit);
         mb.add(menu);
         setJMenuBar(mb);
@@ -132,7 +141,7 @@ public class JUnitWindow extends JFrame {
         c.gridy = 8; c.gridwidth = 2; c.weighty = 0; c.fill = GridBagConstraints.HORIZONTAL;
         p.add(status, c);
         JButton exitBtn = new JButton("Exit");
-        exitBtn.addActionListener(e -> System.exit(0));
+        exitBtn.addActionListener(e -> closeWindow());
         c.gridx = 2; c.gridwidth = 1;
         p.add(exitBtn, c);
 
@@ -147,7 +156,15 @@ public class JUnitWindow extends JFrame {
     }
 
     private void startRun() {
+        ownRun = true;
         String target = String.valueOf(className.getSelectedItem()).trim();
+        resetFor(target);
+        new Thread(() -> execute(target), "junit-run").start();
+    }
+
+    /** Clears the window for a new run of `target`. Call on the Swing thread. */
+    void resetFor(String target) {
+        className.setSelectedItem(target);
         results.clear();
         failureList.clear();
         root.removeAllChildren();
@@ -159,7 +176,6 @@ public class JUnitWindow extends JFrame {
         run.setEnabled(false);
         status.setText("Running " + target + " ...");
         updateCounters();
-        new Thread(() -> execute(target), "junit-run").start();
     }
 
     private void execute(String target) {
@@ -170,16 +186,30 @@ public class JUnitWindow extends JFrame {
                 .build();
         Launcher launcher = LauncherFactory.create();
         TestPlan plan = launcher.discover(req);
-        int count = (int) plan.countTestIdentifiers(t -> t.isTest() && !t.getUniqueId().contains("test-template"));
-        Map<String, DefaultMutableTreeNode> nodes = new HashMap<>();
-
+        int count = countTests(plan);
         SwingUtilities.invokeLater(() -> {
             total = count;
             bar.setMaximum(Math.max(1, count));
             updateCounters();
         });
+        launcher.execute(req, uiListener(plan, start));
+    }
 
-        launcher.execute(req, new TestExecutionListener() {
+    /** Number of tests known before the run (J-06 cases are added as they start). */
+    static int countTests(TestPlan plan) {
+        return (int) plan.countTestIdentifiers(t -> t.isTest() && !t.getUniqueId().contains("test-template"));
+    }
+
+    void setTotal(int count) {
+        total = count;
+        bar.setMaximum(Math.max(1, count));
+        updateCounters();
+    }
+
+    /** Listener that shows a running test plan in this window. */
+    TestExecutionListener uiListener(TestPlan plan, long start) {
+        Map<String, DefaultMutableTreeNode> nodes = new HashMap<>();
+        return new TestExecutionListener() {
             @Override
             public void dynamicTestRegistered(TestIdentifier id) {
                 // Parameterized cases (J-06) are only known once they start.
@@ -229,17 +259,20 @@ public class JUnitWindow extends JFrame {
                     updateCounters();
                 });
             }
-        });
 
-        double secs = (System.nanoTime() - start) / 1e9;
-        SwingUtilities.invokeLater(() -> {
-            sortResults();
-            ((DefaultTreeModel) tree.getModel()).reload();
-            for (int i = 0; i < tree.getRowCount(); i++) tree.expandRow(i);
-            tabs.setSelectedIndex(failureList.isEmpty() ? 1 : 0);
-            status.setText(String.format("Finished: %.3f seconds", secs));
-            run.setEnabled(true);
-        });
+            @Override
+            public void testPlanExecutionFinished(TestPlan finished) {
+                double secs = (System.nanoTime() - start) / 1e9;
+                SwingUtilities.invokeLater(() -> {
+                    sortResults();
+                    ((DefaultTreeModel) tree.getModel()).reload();
+                    for (int i = 0; i < tree.getRowCount(); i++) tree.expandRow(i);
+                    tabs.setSelectedIndex(failureList.isEmpty() ? 1 : 0);
+                    status.setText(String.format("Finished: %.3f seconds", secs));
+                    run.setEnabled(true);
+                });
+            }
+        };
     }
 
     /** Lists results in J-number order (they finish in any order). */
