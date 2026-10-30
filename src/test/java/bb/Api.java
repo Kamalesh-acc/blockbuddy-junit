@@ -110,12 +110,11 @@ public final class Api {
 
     /** Creates a confirmed test account on the test copy and signs it in. No email is sent. */
     public static TestUser createUser(String email) throws Exception {
-        HttpResponse<String> r = HTTP.send(HttpRequest.newBuilder(URI.create(BASE_URL + "/api/test-support/user"))
-                        .timeout(Duration.ofSeconds(60))
-                        .header("Content-Type", "application/json")
-                        .POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(Map.of("email", email))))
-                        .build(),
-                HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> r = send(HttpRequest.newBuilder(URI.create(BASE_URL + "/api/test-support/user"))
+                .timeout(Duration.ofSeconds(60))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(Map.of("email", email))))
+                .build());
         if (r.statusCode() != 200) {
             throw new IllegalStateException("Could not create test user: " + r.statusCode() + " " + r.body());
         }
@@ -179,8 +178,20 @@ public final class Api {
         HttpRequest.BodyPublisher pub = body == null
                 ? HttpRequest.BodyPublishers.noBody()
                 : HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(body));
-        HttpResponse<String> r = HTTP.send(b.method(method, pub).build(), HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> r = send(b.method(method, pub).build());
         return new Res(r.statusCode(), r.body());
+    }
+
+    /** Sends a request. If the connection drops (weak Wi-Fi), waits and tries again, up to 4 times. */
+    static HttpResponse<String> send(HttpRequest req) throws Exception {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return HTTP.send(req, HttpResponse.BodyHandlers.ofString());
+            } catch (java.io.IOException e) {
+                if (attempt == 4) throw e;
+                Thread.sleep(1500L * attempt);
+            }
+        }
     }
 
     public static Res claimHandle(TestUser u, String handle, String name) throws Exception {
